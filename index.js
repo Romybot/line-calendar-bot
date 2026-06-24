@@ -33,9 +33,11 @@ async function handleTextMessage(event) {
   const replyToken = event.replyToken;
 
   try {
-    // 1. 呼叫 Gemini API 解析行程（修正：加入 $ 符號與標準 Gemini 網址結構）
-    const geminiUrl = `https://googleapis.com{process.env.GEMINI_API_KEY}`;
-    const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"${userMessage}"\n\n目前的正確時間是 2026年6月24日。請精確換算出該行程的正確西元年月日與具體時間（24小時制，如果沒給具體時間則預設為上午09:00）。請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss（請自動設為開始時間的一小時後）"\n}`;
+    // 1. 安全讀取並清洗 Gemini API KEY（採用最安全拼接與正確 Gemini 官方大腦路徑）
+    const secureApiKey = (process.env.GEMINI_API_KEY || '').trim();
+    const geminiUrl = "https://googleapis.com" + secureApiKey;
+
+    const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"\${userMessage}"\n\n目前的正確時間是 2026年6月24日。請精確換算出該行程的正確西元年月日與具體時間（24小時制，如果沒給具體時間則預設為上午09:00）。請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss（請自動設為開始時間的一小時後）"\n}`;
 
     const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
     const geminiResponse = await fetch(geminiUrl, {
@@ -50,9 +52,15 @@ async function handleTextMessage(event) {
     }
 
     const geminiData = await geminiResponse.json();
+    
+    // 安全防護：確保 API 回傳結構完整
+    if (!geminiData.candidates || !geminiData.candidates[0] || !geminiData.candidates[0].content || !geminiData.candidates[0].content.parts || !geminiData.candidates[0].content.parts[0]) {
+      throw new Error("Gemini API 未回傳有效的文字內容：" + JSON.stringify(geminiData));
+    }
+    
     const aiText = geminiData.candidates[0].content.parts[0].text.trim();
     
-    // 預防 AI 有時還是會固執吐出 ```json ... ``` 標籤，進行強制過濾
+    // 強制移除 AI 有時會自動加上的 ```json 標籤
     const cleanJsonText = aiText.replace(/```json|```/g, '').trim();
     const parsedEvent = JSON.parse(cleanJsonText);
 
@@ -60,7 +68,7 @@ async function handleTextMessage(event) {
     const auth = new GoogleAuth({
       credentials: {
         client_email: process.env.GOOGLE_CLIENT_EMAIL,
-        private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        private_key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
       },
       scopes: ['https://googleapis.com'],
     });
@@ -75,7 +83,7 @@ async function handleTextMessage(event) {
       },
     });
 
-    // 3. 回覆 LINE 訊息
+    // 3. 回覆 LINE 成功訊息
     await client.replyMessage({
       replyToken: replyToken,
       messages: [{ type: 'text', text: `📅 報告！已成功為您寫入 Google 日曆囉！\n\n📌 項目：${parsedEvent.summary}\n⏰ 時間：${parsedEvent.startTime.replace('T', ' ')}` }]
