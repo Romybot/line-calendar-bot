@@ -35,7 +35,7 @@ async function handleTextMessage(event) {
   try {
     // 1. 呼叫 Gemini API 解析訊息（修正：正確的官方端點 + 模型名稱 + ?key= 帶金鑰）
     const secureApiKey = (process.env.GEMINI_API_KEY || '').trim();
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${secureApiKey}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${secureApiKey}`;
 
     // 修正：拿掉 ${userMessage} 前面多餘的反斜線，否則訊息內容不會真的被代入
     const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"${userMessage}"\n\n目前的正確時間是 2026年6月24日。請精確換算出該行程的正確西元年月日與具體時間（24小時制，如果沒給具體時間則預設為上午09:00）。請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss（請自動設為開始時間的一小時後）"\n}`;
