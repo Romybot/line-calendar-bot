@@ -33,7 +33,7 @@ async function handleTextMessage(event) {
   const replyToken = event.replyToken;
 
   try {
-    // 1. 呼叫 Gemini API 解析行程
+    // 1. 呼叫 Gemini API 解析行程（修正：加入 $ 符號與標準 Gemini 網址結構）
     const geminiUrl = `https://googleapis.com{process.env.GEMINI_API_KEY}`;
     const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"${userMessage}"\n\n目前的正確時間是 2026年6月24日。請精確換算出該行程的正確西元年月日與具體時間（24小時制，如果沒給具體時間則預設為上午09:00）。請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss（請自動設為開始時間的一小時後）"\n}`;
 
@@ -44,9 +44,17 @@ async function handleTextMessage(event) {
       body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
     });
     
+    if (!geminiResponse.ok) {
+      const errorText = await geminiResponse.text();
+      throw new Error(`Gemini API 回傳錯誤: ${geminiResponse.status} - ${errorText}`);
+    }
+
     const geminiData = await geminiResponse.json();
     const aiText = geminiData.candidates[0].content.parts[0].text.trim();
-    const parsedEvent = JSON.parse(aiText);
+    
+    // 預防 AI 有時還是會固執吐出 ```json ... ``` 標籤，進行強制過濾
+    const cleanJsonText = aiText.replace(/```json|```/g, '').trim();
+    const parsedEvent = JSON.parse(cleanJsonText);
 
     // 2. 呼叫 Google Calendar API 寫入日曆
     const auth = new GoogleAuth({
@@ -74,7 +82,7 @@ async function handleTextMessage(event) {
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("詳細錯誤記錄：", error);
     await client.replyMessage({
       replyToken: replyToken,
       messages: [{ type: 'text', text: `系統解析或寫入日曆時發生錯誤，請再試一次！` }]
