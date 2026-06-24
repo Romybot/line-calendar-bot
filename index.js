@@ -38,7 +38,7 @@ async function handleTextMessage(event) {
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${secureApiKey}`;
 
     // 修正：拿掉 ${userMessage} 前面多餘的反斜線，否則訊息內容不會真的被代入
-    const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"${userMessage}"\n\n目前的正確時間是 2026年6月24日。請精確換算出該行程的正確西元年月日與具體時間（24小時制，如果沒給具體時間則預設為上午09:00）。請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss（請自動設為開始時間的一小時後）"\n}`;
+    const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"${userMessage}"\n\n目前的正確時間是 2026年6月24日。請精確換算出該行程的正確西元年月日與具體時間（24小時制，如果沒給具體時間則預設為上午09:00）。\n\n關於結束時間的判斷規則：\n1. 如果使用者明確提到結束時間或時段（例如「3點到5點」「下午2點到4點」「2點半到3點半的會議」），請直接使用使用者指定的結束時間。\n2. 如果使用者完全沒有提到結束時間，則自動設為開始時間的一小時後。\n\n請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss"\n}`;
 
     const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
     const geminiResponse = await fetch(geminiUrl, {
