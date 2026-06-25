@@ -1,0 +1,5 @@
+{
+     "crons": [
+       { "path": "/api/remind?type=weather", "schedule": "15 23 * * *" }
+     ]
+   }
