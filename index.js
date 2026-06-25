@@ -4,6 +4,7 @@ const { GoogleAuth } = require('google-auth-library');
 const { google } = require('googleapis');
 
 const app = express();
+app.use(express.json()); // 讓 Express 能解析手機捷徑傳來的 JSON 格式座標
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -15,7 +16,7 @@ const client = new messagingApi.MessagingApiClient({
 });
 
 app.get('/', (req, res) => {
-  res.send('LINE 行事曆管家（Gemini + 連網搜尋版）運作中 ✅');
+  res.send('LINE 行事曆管家（Gemini + 連網搜尋 + 定位天氣版）運作中 ✅');
 });
 
 app.post('/webhook', middleware(lineConfig), async (req, res) => {
@@ -27,6 +28,102 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
   }
   res.sendStatus(200);
 });
+
+// ===== Upstash Redis 簡易存取（用來存「最新一次手機回傳的座標」）=====
+
+async function upstashSet(key, value) {
+  const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+  const url = `${process.env.UPSTASH_REDIS_REST_URL}/set/${key}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(value)
+  });
+  if (!res.ok) throw new Error('寫入 Upstash 失敗: ' + (await res.text()));
+  return res.json();
+}
+
+async function upstashGet(key) {
+  const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+  const url = `${process.env.UPSTASH_REDIS_REST_URL}/get/${key}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` }
+  });
+  if (!res.ok) throw new Error('讀取 Upstash 失敗: ' + (await res.text()));
+  const data = await res.json();
+  return data.result ? JSON.parse(data.result) : null;
+}
+
+// ===== 手機捷徑會打這個網址，把目前 GPS 座標送進來存起來 =====
+app.post('/api/location-update', async (req, res) => {
+  const secret = req.headers['x-location-secret'] || req.query.secret;
+  if (!process.env.LOCATION_SECRET || secret !== process.env.LOCATION_SECRET) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const { latitude, longitude } = req.body;
+  if (latitude === undefined || longitude === undefined) {
+    return res.status(400).send('缺少 latitude 或 longitude');
+  }
+
+  try {
+    await upstashSet('latest_location', { latitude, longitude, updatedAt: new Date().toISOString() });
+    res.status(200).send('座標已收到並存好囉');
+  } catch (err) {
+    console.error('儲存座標時發生錯誤：', err);
+    res.status(500).send('儲存失敗');
+  }
+});
+
+// ===== 定時提醒功能 =====
+
+// Cron 排程會打這個網址，目前只用來推送「定位天氣」
+app.get('/api/remind', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const expected = `Bearer ${process.env.CRON_SECRET}`;
+  if (!process.env.CRON_SECRET || authHeader !== expected) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const type = req.query.type;
+
+  try {
+    if (type === 'weather') {
+      await pushLocationWeather();
+      return res.status(200).send('已推送定位天氣');
+    }
+    res.status(400).send(`未知的提醒類型: ${type}`);
+  } catch (err) {
+    console.error('推播提醒時發生錯誤：', err);
+    res.status(500).send('推播失敗');
+  }
+});
+
+async function pushLocationWeather() {
+  const location = await upstashGet('latest_location');
+
+  let text;
+  if (!location) {
+    text = '🌅 早安！不過我還沒收到你手機回傳的位置資料，沒辦法幫你查當地天氣，麻煩確認一下手機捷徑有沒有正常執行喔。';
+  } else {
+    const todayStr = getTaipeiTodayString();
+    const prompt = `今天日期是 ${todayStr}（台灣時區）。使用者目前的座標是：緯度 ${location.latitude}, 經度 ${location.longitude}。\n\n請先利用搜尋判斷這個座標大致位於哪個城市/行政區，然後查詢該地點今天的天氣預報，用繁體中文簡潔地回覆，內容包含：\n1. 所在地點（city/區）\n2. 目前天氣狀況與溫度\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖等實用建議）\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 100 字以內。開頭請用「🌅 早安！」。`;
+
+    const geminiData = await callGemini({
+      contents: [{ parts: [{ text: prompt }] }],
+      tools: [{ google_search: {} }]
+    });
+    text = extractText(geminiData);
+  }
+
+  await client.pushMessage({
+    to: process.env.LINE_USER_ID,
+    messages: [{ type: 'text', text }],
+  });
+}
 
 // 取得台灣時區的今天日期字串 YYYY-MM-DD（自動抓系統當天）
 function getTaipeiTodayString() {
@@ -87,7 +184,7 @@ async function classifyIntent(userMessage) {
   return text.includes('calendar') ? 'calendar' : 'chat';
 }
 
-// 行程記錄流程（跟之前一樣）
+// 行程記錄流程
 async function handleCalendarIntent(userMessage, replyToken) {
   const todayStr = getTaipeiTodayString();
 
@@ -122,7 +219,7 @@ async function handleCalendarIntent(userMessage, replyToken) {
   });
 }
 
-// 連網問答流程（新功能：天氣、旅遊、評價等開放性問題）
+// 連網問答流程
 async function handleChatIntent(userMessage, replyToken) {
   const todayStr = getTaipeiTodayString();
 
@@ -146,6 +243,9 @@ async function handleChatIntent(userMessage, replyToken) {
 async function handleTextMessage(event) {
   const userMessage = event.message.text;
   const replyToken = event.replyToken;
+
+  // 偵測用：把使用者的 LINE userId 印到 log，方便你去 Vercel Logs 複製
+  console.log('=== 你的 LINE userId 是：', event.source.userId, '===');
 
   try {
     const intent = await classifyIntent(userMessage);
