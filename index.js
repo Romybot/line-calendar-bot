@@ -4,7 +4,9 @@ const { GoogleAuth } = require('google-auth-library');
 const { google } = require('googleapis');
 
 const app = express();
-app.use(express.json()); // 讓 Express 能解析手機捷徑傳來的 JSON 格式座標
+// 注意：不能用 app.use(express.json()) 套用到全部路由，
+// 否則會搶先解析掉 LINE webhook 需要的原始內容，導致簽章驗證失敗。
+// 改成只在需要 JSON 的路由上個別套用（見下方 /api/location-update）。
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -58,7 +60,7 @@ async function upstashGet(key) {
 }
 
 // ===== 手機捷徑會打這個網址，把目前 GPS 座標送進來存起來 =====
-app.post('/api/location-update', async (req, res) => {
+app.post('/api/location-update', express.json(), async (req, res) => {
   const secret = req.headers['x-location-secret'] || req.query.secret;
   if (!process.env.LOCATION_SECRET || secret !== process.env.LOCATION_SECRET) {
     return res.status(401).send('Unauthorized');
