@@ -64,13 +64,16 @@ app.post('/api/location-update', async (req, res) => {
     return res.status(401).send('Unauthorized');
   }
 
-  const { latitude, longitude } = req.body;
-  if (latitude === undefined || longitude === undefined) {
-    return res.status(400).send('缺少 latitude 或 longitude');
+  const { lat, lon, latitude, longitude } = req.body;
+  const finalLat = lat !== undefined ? lat : latitude;
+  const finalLon = lon !== undefined ? lon : longitude;
+
+  if (finalLat === undefined || finalLon === undefined) {
+    return res.status(400).send('缺少座標資料（需要 lat/lon 或 latitude/longitude）');
   }
 
   try {
-    await upstashSet('latest_location', { latitude, longitude, updatedAt: new Date().toISOString() });
+    await upstashSet('latest_location', { latitude: finalLat, longitude: finalLon, updatedAt: new Date().toISOString() });
     res.status(200).send('座標已收到並存好囉');
   } catch (err) {
     console.error('儲存座標時發生錯誤：', err);
