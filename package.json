@@ -1,18 +1,5 @@
 {
-  "name": "line-calendar-assistant",
-  "version": "1.0.0",
-  "description": "LINE 行事曆管家 - 用 LINE 訊息自動建立 Google Calendar 行程",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "@line/bot-sdk": "^9.5.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "googleapis": "^140.0.0"
-  }
+  "crons": [
+    { "path": "/api/remind?type=weather", "schedule": "5 23 * * *" }
+  ]
 }
