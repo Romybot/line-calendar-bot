@@ -172,79 +172,7 @@ function extractText(geminiData) {
   return geminiData.candidates[0].content.parts[0].text.trim();
 }
 
-// 第一步：判斷使用者這句話，是要記行程，還是要問問題/查資料
-async function classifyIntent(userMessage) {
-  const data = await callGemini({
-    contents: [{
-      parts: [{
-        text: `請判斷使用者這句訊息屬於哪一種類型，只回傳「calendar」或「chat」這兩個字其中一個，不要有其他任何文字、不要加標點符號：
-- 如果使用者是要「新增/記錄一個行程或請假」，回傳：calendar
-- 其他所有情況（問問題、查天氣、查旅遊資訊、查評價、聊天等），回傳：chat
-
-使用者訊息："${userMessage}"`
-      }]
-    }]
-  });
-  const text = extractText(data).toLowerCase();
-  return text.includes('calendar') ? 'calendar' : 'chat';
-}
-
-// 行程記錄流程
-async function handleCalendarIntent(userMessage, replyToken) {
-  const todayStr = getTaipeiTodayString();
-
-  const prompt = `你是一個時間與行程解析助手。請幫我解析使用者傳來的這段 LINE 訊息：\n"${userMessage}"\n\n目前的正確時間是 ${todayStr}（台灣時區）。請精確換算出該行程的正確西元年月日與具體開始時間（24小時制，如果沒給具體開始時間則預設為上午09:00）。\n\n關於結束時間的判斷規則：\n1. 如果使用者明確提到結束時間或時段（例如「3點到5點」「下午2點到4點」），請直接使用使用者指定的結束時間。\n2. 如果使用者完全沒有提到結束時間，則自動設為開始時間的一小時後。\n\n請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json）：\n{\n  "summary": "行程的標題",\n  "startTime": "YYYY-MM-DDTHH:mm:ss",\n  "endTime": "YYYY-MM-DDTHH:mm:ss"\n}`;
-
-  const geminiData = await callGemini({ contents: [{ parts: [{ text: prompt }] }] });
-  const aiText = extractText(geminiData);
-  const cleanJsonText = aiText.replace(/```json|```/g, '').trim();
-  const parsedEvent = JSON.parse(cleanJsonText);
-
-  const auth = new GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
-    },
-    scopes: ['https://www.googleapis.com/auth/calendar'],
-  });
-
-  const calendar = google.calendar({ version: 'v3', auth });
-  await calendar.events.insert({
-    calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
-    requestBody: {
-      summary: parsedEvent.summary,
-      start: { dateTime: parsedEvent.startTime, timeZone: 'Asia/Taipei' },
-      end: { dateTime: parsedEvent.endTime, timeZone: 'Asia/Taipei' },
-    },
-  });
-
-  await client.replyMessage({
-    replyToken,
-    messages: [{ type: 'text', text: `📅 報告！已成功為您寫入 Google 日曆囉！\n\n📌 項目：${parsedEvent.summary}\n⏰ 時間：${parsedEvent.startTime.replace('T', ' ')}` }]
-  });
-}
-
-// 連網問答流程
-async function handleChatIntent(userMessage, replyToken) {
-  const todayStr = getTaipeiTodayString();
-
-  const geminiData = await callGemini({
-    contents: [{
-      parts: [{
-        text: `今天的日期是 ${todayStr}（台灣時區）。請用繁體中文，口語、簡潔地回答以下問題。如果問題需要最新資訊（例如天氣、新聞、評價、營業時間等），請主動使用搜尋工具查詢後再回答：\n\n${userMessage}`
-      }]
-    }],
-    tools: [{ google_search: {} }]
-  });
-
-  const aiText = extractText(geminiData);
-
-  await client.replyMessage({
-    replyToken,
-    messages: [{ type: 'text', text: aiText }]
-  });
-}
-
+// 合併版：一次呼叫 Gemini，同時判斷意圖「並」給出處理結果（行程資料 或 聊天回覆）
 async function handleTextMessage(event) {
   const userMessage = event.message.text;
   const replyToken = event.replyToken;
@@ -253,12 +181,67 @@ async function handleTextMessage(event) {
   console.log('=== 你的 LINE userId 是：', event.source.userId, '===');
 
   try {
-    const intent = await classifyIntent(userMessage);
+    const todayStr = getTaipeiTodayString();
 
-    if (intent === 'calendar') {
-      await handleCalendarIntent(userMessage, replyToken);
+    const prompt = `你是一個 LINE 機器人助理，請判斷使用者這句訊息屬於哪一種類型，並依規則直接給出處理結果。
+
+今天的正確日期是 ${todayStr}（台灣時區）。
+
+請嚴格遵循以下 JSON 格式回覆，不要包含任何 markdown 標籤（如 \`\`\`json），也不要有其他文字：
+{
+  "action": "calendar 或 chat",
+  "summary": "（action 為 calendar 時填寫：行程標題；其他情況留空字串）",
+  "startTime": "（action 為 calendar 時填寫：YYYY-MM-DDTHH:mm:ss；其他情況留空字串）",
+  "endTime": "（action 為 calendar 時填寫：YYYY-MM-DDTHH:mm:ss；其他情況留空字串）",
+  "chatReply": "（action 為 chat 時填寫：用繁體中文口語、簡潔地回答使用者的問題；其他情況留空字串）"
+}
+
+判斷規則：
+1. 如果使用者是要「新增/記錄一個行程或請假」，action 設為 calendar，並解析出：
+   - summary：行程標題
+   - startTime：精確換算成西元年月日與24小時制時間（沒給具體時間預設為當天09:00）
+   - endTime：如果使用者明確提到結束時間或時段（例如「3點到5點」），直接使用；如果完全沒提到，則自動設為開始時間的一小時後
+2. 其他所有情況（問問題、查天氣、查旅遊資訊、查評價、聊天等），action 設為 chat，並在 chatReply 填入完整回答。如果問題需要最新資訊（例如天氣、新聞、評價、營業時間等），請主動使用搜尋工具查詢後再回答。
+
+使用者訊息："${userMessage}"`;
+
+    const geminiData = await callGemini({
+      contents: [{ parts: [{ text: prompt }] }],
+      tools: [{ google_search: {} }]
+    });
+
+    const aiText = extractText(geminiData);
+    const cleanJsonText = aiText.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(cleanJsonText);
+
+    if (parsed.action === 'calendar') {
+      const auth = new GoogleAuth({
+        credentials: {
+          client_email: process.env.GOOGLE_CLIENT_EMAIL,
+          private_key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
+        },
+        scopes: ['https://www.googleapis.com/auth/calendar'],
+      });
+
+      const calendar = google.calendar({ version: 'v3', auth });
+      await calendar.events.insert({
+        calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+        requestBody: {
+          summary: parsed.summary,
+          start: { dateTime: parsed.startTime, timeZone: 'Asia/Taipei' },
+          end: { dateTime: parsed.endTime, timeZone: 'Asia/Taipei' },
+        },
+      });
+
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: `📅 報告！已成功為您寫入 Google 日曆囉！\n\n📌 項目：${parsed.summary}\n⏰ 時間：${parsed.startTime.replace('T', ' ')}` }]
+      });
     } else {
-      await handleChatIntent(userMessage, replyToken);
+      await client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: parsed.chatReply || '嗯...我沒有想到要怎麼回答，可以換個方式問我嗎？' }]
+      });
     }
 
   } catch (error) {
