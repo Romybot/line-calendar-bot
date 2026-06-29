@@ -2,6 +2,8 @@ const express = require('express');
 const { middleware, messagingApi } = require('@line/bot-sdk');
 const { GoogleAuth } = require('google-auth-library');
 const { google } = require('googleapis');
+const Parser = require('rss-parser');
+const rssParser = new Parser();
 
 const app = express();
 // 注意：不能用 app.use(express.json()) 套用到全部路由，
@@ -100,6 +102,10 @@ app.get('/api/remind', async (req, res) => {
       await pushLocationWeather();
       return res.status(200).send('已推送定位天氣');
     }
+    if (type === 'news') {
+      await pushNewsBriefing();
+      return res.status(200).send('已推送科技晨報');
+    }
     res.status(400).send(`未知的提醒類型: ${type}`);
   } catch (err) {
     console.error('推播提醒時發生錯誤：', err);
@@ -107,15 +113,68 @@ app.get('/api/remind', async (req, res) => {
   }
 });
 
+// 免費科技媒體 RSS 來源，之後想換掉或多加，直接在這裡改這個陣列就好
+const NEWS_FEEDS = [
+  { name: '科技新報', url: 'https://technews.tw/feed/' },
+  { name: 'INSIDE', url: 'https://www.inside.com.tw/feed' },
+  { name: 'TechCrunch', url: 'https://techcrunch.com/feed/' },
+];
+
+async function fetchAllNewsItems() {
+  const results = [];
+
+  for (const feed of NEWS_FEEDS) {
+    try {
+      const parsed = await rssParser.parseURL(feed.url);
+      const items = (parsed.items || []).slice(0, 5).map((item) => ({
+        source: feed.name,
+        title: item.title || '',
+        summary: (item.contentSnippet || item.summary || '').slice(0, 150),
+      }));
+      results.push(...items);
+    } catch (err) {
+      // 單一來源抓取失敗就跳過，不影響其他來源
+      console.error(`抓取 ${feed.name} RSS 失敗：`, err.message);
+    }
+  }
+
+  return results;
+}
+
+async function pushNewsBriefing() {
+  const newsItems = await fetchAllNewsItems();
+
+  let text;
+  if (newsItems.length === 0) {
+    text = '📰 早安！今天抓不到任何新聞來源，可能來源網站暫時有狀況，晚點再試試看。';
+  } else {
+    const newsListText = newsItems
+      .map((item, i) => `${i + 1}. [${item.source}] ${item.title}：${item.summary}`)
+      .join('\n');
+
+    const prompt = `以下是今天從幾個科技媒體抓到的新聞標題與摘要：\n\n${newsListText}\n\n請從中挑選 3 個今天最重要、最值得知道的科技大事，每條用約 30 個字總結精華，用繁體中文。請嚴格遵循以下格式回覆，不要有其他文字、不要markdown：\n\n📰 早安！今天的科技晨報：\n\n1. （第一條摘要）\n2. （第二條摘要）\n3. （第三條摘要）`;
+
+    const geminiData = await callGemini({
+      contents: [{ parts: [{ text: prompt }] }]
+    });
+    text = extractText(geminiData);
+  }
+
+  await client.pushMessage({
+    to: process.env.LINE_USER_ID,
+    messages: [{ type: 'text', text }],
+  });
+}
+
 async function pushLocationWeather() {
   const location = await upstashGet('latest_location');
 
   let text;
   if (!location) {
-    text = '🌅 早安！不過我還沒收到你手機回傳的位置資料，沒辦法幫你查當地天氣，麻煩確認一下手機捷徑有沒有正常執行喔。';
+    text = '🌙 晚安！不過我還沒收到你手機回傳的位置資料，沒辦法幫你查當地天氣，麻煩確認一下手機捷徑有沒有正常執行喔。';
   } else {
-    const todayStr = getTaipeiTodayString();
-    const prompt = `今天日期是 ${todayStr}（台灣時區）。使用者目前的座標是：緯度 ${location.latitude}, 經度 ${location.longitude}。\n\n請先利用搜尋判斷這個座標大致位於哪個城市/行政區，然後查詢該地點今天的天氣預報，用繁體中文簡潔地回覆，內容包含：\n1. 所在地點（city/區）\n2. 目前天氣狀況與溫度\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖等實用建議）\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 100 字以內。開頭請用「🌅 早安！」。`;
+    const tomorrowStr = getTaipeiTomorrowString();
+    const prompt = `今天是晚上，明天的日期是 ${tomorrowStr}（台灣時區）。使用者目前（今晚）的座標是：緯度 ${location.latitude}, 經度 ${location.longitude}。\n\n請先利用搜尋判斷這個座標大致位於哪個城市/行政區，然後查詢「明天（${tomorrowStr}）」該地點的天氣預報（不是今晚的天氣），用繁體中文簡潔地回覆，內容包含：\n1. 所在地點（city/區）\n2. 明天的天氣狀況與溫度範圍\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖等實用建議）\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 100 字以內。開頭請用「🌙 晚安！」。`;
 
     const geminiData = await callGemini({
       contents: [{ parts: [{ text: prompt }] }],
@@ -128,6 +187,17 @@ async function pushLocationWeather() {
     to: process.env.LINE_USER_ID,
     messages: [{ type: 'text', text }],
   });
+}
+
+// 取得台灣時區的明天日期字串 YYYY-MM-DD
+function getTaipeiTomorrowString() {
+  const now = new Date();
+  const taipeiNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  taipeiNow.setDate(taipeiNow.getDate() + 1);
+  const y = taipeiNow.getFullYear();
+  const m = String(taipeiNow.getMonth() + 1).padStart(2, '0');
+  const d = String(taipeiNow.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 // 取得台灣時區的今天日期字串 YYYY-MM-DD（自動抓系統當天）
