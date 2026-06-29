@@ -15,6 +15,7 @@
     "express": "^4.19.2",
     "google-auth-library": "^9.14.1",
     "googleapis": "^140.0.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "rss-parser": "^3.13.0"
   }
 }
