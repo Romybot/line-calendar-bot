@@ -1,5 +1,6 @@
 {
-     "crons": [
-       { "path": "/api/remind?type=weather", "schedule": "15 23 * * *" }
-     ]
-   }
+  "crons": [
+    { "path": "/api/remind?type=weather", "schedule": "0 14 * * *" },
+    { "path": "/api/remind?type=news", "schedule": "20 23 * * *" }
+  ]
+}
