@@ -190,22 +190,18 @@ async function fetchNearestAqiStation(lat, lon) {
   const res = await fetch(url);
   if (!res.ok) throw new Error('查詢空氣品質API失敗: ' + res.status);
   const data = await res.json();
-  const records = data.records || [];
+  // 修正：API 直接回傳陣列，不是包在 {records: [...]} 裡面
+  const records = Array.isArray(data) ? data : (data.records || []);
 
-  // 除錯用：印出抓到的筆數，以及第一筆資料的內容（方便確認欄位名稱、API金鑰是否生效）
   console.log('AQI API 回應筆數：', records.length);
-  if (records.length > 0) {
-    console.log('AQI 第一筆資料範例：', JSON.stringify(records[0]));
-  } else {
-    console.log('AQI API 完整回應內容：', JSON.stringify(data).slice(0, 500));
-  }
 
   let nearest = null;
   let minDist = Infinity;
 
   for (const r of records) {
-    const stationLat = parseFloat(r.Latitude);
-    const stationLon = parseFloat(r.Longitude);
+    // 修正：實際欄位名稱是小寫的 latitude / longitude
+    const stationLat = parseFloat(r.latitude);
+    const stationLon = parseFloat(r.longitude);
     if (isNaN(stationLat) || isNaN(stationLon)) continue;
     const dist = haversineDistance(lat, lon, stationLat, stationLon);
     if (dist < minDist) {
@@ -250,9 +246,9 @@ async function pushAqiAlert() {
     return;
   }
 
-  const { level, advice } = describeAqi(station.AQI);
-  const pm25 = station['PM2.5'] || '無資料';
-  const text = `🌫️ 空氣品質報告（測站：${station.SiteName}）\nAQI：${station.AQI}（${level}）\nPM2.5：${pm25} μg/m³\n\n${advice}`;
+  const { level, advice } = describeAqi(station.aqi);
+  const pm25 = station['pm2.5'] || '無資料';
+  const text = `🌫️ 空氣品質報告（測站：${station.sitename}）\nAQI：${station.aqi}（${level}）\nPM2.5：${pm25} μg/m³\n\n${advice}`;
 
   await client.pushMessage({
     to: process.env.LINE_USER_ID,
