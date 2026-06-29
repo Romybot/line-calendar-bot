@@ -106,6 +106,10 @@ app.get('/api/remind', async (req, res) => {
       await pushNewsBriefing();
       return res.status(200).send('已推送科技晨報');
     }
+    if (type === 'aqi') {
+      await pushAqiAlert();
+      return res.status(200).send('已推送空氣品質警示');
+    }
     res.status(400).send(`未知的提醒類型: ${type}`);
   } catch (err) {
     console.error('推播提醒時發生錯誤：', err);
@@ -163,6 +167,88 @@ async function pushNewsBriefing() {
   await client.pushMessage({
     to: process.env.LINE_USER_ID,
     messages: [{ type: 'text', text }],
+  });
+}
+
+// ===== 空氣品質警示（完全不耗用 Gemini 額度，純資料抓取 + 邏輯判斷）=====
+
+// 計算兩個座標之間的距離（公里），用來找離使用者最近的測站
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+async function fetchNearestAqiStation(lat, lon) {
+  const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+  const url = `https://data.moenv.gov.tw/api/v2/aqx_p_432?offset=0&limit=1000&api_key=${process.env.MOENV_API_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('查詢空氣品質API失敗: ' + res.status);
+  const data = await res.json();
+  const records = data.records || [];
+
+  let nearest = null;
+  let minDist = Infinity;
+
+  for (const r of records) {
+    const stationLat = parseFloat(r.Latitude);
+    const stationLon = parseFloat(r.Longitude);
+    if (isNaN(stationLat) || isNaN(stationLon)) continue;
+    const dist = haversineDistance(lat, lon, stationLat, stationLon);
+    if (dist < minDist) {
+      minDist = dist;
+      nearest = r;
+    }
+  }
+
+  return nearest;
+}
+
+// AQI 數值對應等級與建議（依環境部公告標準）
+function describeAqi(aqiValue) {
+  const aqi = parseInt(aqiValue, 10);
+  if (isNaN(aqi)) return { level: '無資料', advice: '目前查不到有效的AQI數值，可能該測站暫時無回報。' };
+  if (aqi <= 50) return { level: '良好 🟢', advice: '空氣品質良好，戶外活動不受影響。' };
+  if (aqi <= 100) return { level: '普通 🟡', advice: '空氣品質普通，一般人沒有太大影響。' };
+  if (aqi <= 150) return { level: '對敏感族群不健康 🟠', advice: '過敏、心臟病、呼吸道疾病患者及兒童、老年人建議減少戶外活動。' };
+  if (aqi <= 200) return { level: '對所有族群不健康 🔴', advice: '建議減少戶外活動，外出記得戴口罩。' };
+  if (aqi <= 300) return { level: '非常不健康 🟣', advice: '建議避免戶外活動，外出務必戴口罩。' };
+  return { level: '危害 🟤', advice: '建議留在室內，盡量避免外出。' };
+}
+
+async function pushAqiAlert() {
+  const location = await upstashGet('latest_location');
+
+  if (!location) {
+    await client.pushMessage({
+      to: process.env.LINE_USER_ID,
+      messages: [{ type: 'text', text: '🌫️ 沒有你目前的位置資料，無法查詢空氣品質，請確認手機定位捷徑是否正常執行。' }]
+    });
+    return;
+  }
+
+  const station = await fetchNearestAqiStation(location.latitude, location.longitude);
+
+  if (!station) {
+    await client.pushMessage({
+      to: process.env.LINE_USER_ID,
+      messages: [{ type: 'text', text: '🌫️ 暫時查不到附近的空氣品質測站資料，可能API回應有誤，請稍後再試。' }]
+    });
+    return;
+  }
+
+  const { level, advice } = describeAqi(station.AQI);
+  const pm25 = station['PM2.5'] || '無資料';
+  const text = `🌫️ 空氣品質報告（測站：${station.SiteName}）\nAQI：${station.AQI}（${level}）\nPM2.5：${pm25} μg/m³\n\n${advice}`;
+
+  await client.pushMessage({
+    to: process.env.LINE_USER_ID,
+    messages: [{ type: 'text', text }]
   });
 }
 
