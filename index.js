@@ -192,6 +192,14 @@ async function fetchNearestAqiStation(lat, lon) {
   const data = await res.json();
   const records = data.records || [];
 
+  // 除錯用：印出抓到的筆數，以及第一筆資料的內容（方便確認欄位名稱、API金鑰是否生效）
+  console.log('AQI API 回應筆數：', records.length);
+  if (records.length > 0) {
+    console.log('AQI 第一筆資料範例：', JSON.stringify(records[0]));
+  } else {
+    console.log('AQI API 完整回應內容：', JSON.stringify(data).slice(0, 500));
+  }
+
   let nearest = null;
   let minDist = Infinity;
 
