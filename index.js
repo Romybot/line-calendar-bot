@@ -257,21 +257,16 @@ async function pushAqiAlert() {
 }
 
 async function pushLocationWeather() {
-  const location = await upstashGet('latest_location');
+  const location = '龜山（桃園）';
+  const tomorrowStr = getTaipeiTomorrowString();
 
-  let text;
-  if (!location) {
-    text = '🌙 晚安！不過我還沒收到你手機回傳的位置資料，沒辦法幫你查當地天氣，麻煩確認一下手機捷徑有沒有正常執行喔。';
-  } else {
-    const tomorrowStr = getTaipeiTomorrowString();
-    const prompt = `今天是晚上，明天的日期是 ${tomorrowStr}（台灣時區）。使用者目前（今晚）的座標是：緯度 ${location.latitude}, 經度 ${location.longitude}。\n\n請先利用搜尋判斷這個座標大致位於哪個城市/行政區，然後查詢「明天（${tomorrowStr}）」該地點的天氣預報（不是今晚的天氣），用繁體中文簡潔地回覆，內容包含：\n1. 所在地點（city/區）\n2. 明天的天氣狀況與溫度範圍\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖等實用建議）\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 100 字以內。開頭請用「🌙 晚安！」。`;
+  const prompt = `明天的日期是 ${tomorrowStr}（台灣時區）。請查詢「${location}」明天的天氣預報，用繁體中文簡潔地回覆，內容包含：\n1. 所在地點\n2. 明天的天氣狀況與溫度範圍\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖等實用建議）\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 100 字以內。開頭請用「🌙 晚安！」。`;
 
-    const geminiData = await callGemini({
-      contents: [{ parts: [{ text: prompt }] }],
-      tools: [{ google_search: {} }]
-    });
-    text = extractText(geminiData);
-  }
+  const geminiData = await callGemini({
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }]
+  });
+  const text = extractText(geminiData);
 
   await client.pushMessage({
     to: process.env.LINE_USER_ID,
