@@ -226,17 +226,11 @@ function describeAqi(aqiValue) {
 }
 
 async function pushAqiAlert() {
-  const location = await upstashGet('latest_location');
+  // 固定使用龜山（桃園）的座標尋找最近測站
+  const lat = 24.9963;
+  const lon = 121.3761;
 
-  if (!location) {
-    await client.pushMessage({
-      to: process.env.LINE_USER_ID,
-      messages: [{ type: 'text', text: '🌫️ 沒有你目前的位置資料，無法查詢空氣品質，請確認手機定位捷徑是否正常執行。' }]
-    });
-    return;
-  }
-
-  const station = await fetchNearestAqiStation(location.latitude, location.longitude);
+  const station = await fetchNearestAqiStation(lat, lon);
 
   if (!station) {
     await client.pushMessage({
