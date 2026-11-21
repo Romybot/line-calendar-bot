@@ -1,8 +1,6 @@
 {
   "crons": [
-    { "path": "/api/remind?type=weather", "schedule": "0 13 * * *" },
-    { "path": "/api/remind?type=news", "schedule": "0 23 * * *" },
-    { "path": "/api/remind?type=aqi", "schedule": "0 23 * * *" },
-    { "path": "/api/remind?type=aqi", "schedule": "0 9 * * *" }
+    { "path": "/api/remind?type=morning", "schedule": "0 23 * * *" },
+    { "path": "/api/remind?type=evening", "schedule": "0 9 * * *" }
   ]
 }
