@@ -13,12 +13,16 @@ const app = express();
 // ★★★ 你可以自己編輯的設定區（不用懂程式，照範例改就好）★★★
 // =====================================================================
 
-// 財經快報追蹤標的（Finnhub 免費版不支援指數，用 ETF 當代理）
-const FINANCE_SYMBOLS = [
-  { symbol: 'DIA',  label: '道瓊' },
-  { symbol: 'QQQ',  label: 'Nasdaq' },
-  { symbol: 'SOXX', label: '費半' },
-  { symbol: 'MU',   label: '美光' },
+// 股市快報追蹤標的（陣列順序＝顯示順序）
+// source: 'twse'=證交所官方(台股大盤)；'yahoo'=Yahoo Finance(美股/美元/ADR，query1→query2 備援)
+const STOCK_SYMBOLS = [
+  { source: 'twse',  label: '台指' },                       // 發行量加權股價指數（官方）
+  { source: 'yahoo', symbol: 'TSM',      label: '台積電ADR' },
+  { source: 'yahoo', symbol: 'DX-Y.NYB', label: '美元' },
+  { source: 'yahoo', symbol: '^IXIC',    label: '那斯' },
+  { source: 'yahoo', symbol: '^DJI',     label: '道瓊' },
+  { source: 'yahoo', symbol: '^SOX',     label: '費城' },
+  { source: 'yahoo', symbol: '^GSPC',    label: 'S&P' },
 ];
 
 // 固定/週期雜事提醒（到日子當天早上提醒）；type: monthly/yearly/weekly
@@ -97,10 +101,10 @@ app.get('/api/remind', async (req, res) => {
       return res.status(200).send('已推送早安簡報');
     }
     if (type === 'evening') { await pushEveningBriefing(); return res.status(200).send('已推送晚安簡報'); }
+    if (type === 'stock')   { await pushStock();           return res.status(200).send('已推送股市快報'); }
     if (type === 'weather') { await pushSingle(await buildWeatherText()); return res.status(200).send('ok'); }
     if (type === 'news')    { await pushSingle(await buildNewsText());    return res.status(200).send('ok'); }
     if (type === 'aqi')     { await pushSingle(await buildAqiText());     return res.status(200).send('ok'); }
-    if (type === 'finance') { await pushSingle(await buildFinanceText()); return res.status(200).send('ok'); }
     if (type === 'period')  { await pushPeriodReminder();                 return res.status(200).send('ok'); }
     res.status(400).send(`未知的提醒類型: ${type}`);
   } catch (err) {
@@ -121,7 +125,6 @@ async function pushMorningBriefing() {
   const parts = [];
   const news = await safe(buildNewsText);    if (news) parts.push(news);
   const aqi  = await safe(buildAqiText);      if (aqi)  parts.push(aqi);
-  const fin  = await safe(buildFinanceText);  if (fin)  parts.push(fin);
   const rem  = buildReminderText();           if (rem)  parts.push(rem);
   const body = parts.length ? parts.join('\n\n——————————\n\n') : '今天沒有特別的提醒，祝你有美好的一天 🌳';
   await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text: `☀️ 早安！今天的重點：\n\n${body}` }] });
@@ -206,22 +209,63 @@ async function buildWeatherText() {
   return extractText(geminiData);
 }
 
-// ===== 財經快報（Finnhub /quote，0 AI）=====
-async function buildFinanceText() {
-  const key = (process.env.FINNHUB_API_KEY || '').trim();
-  if (!key) return null;
+// ===== 股市快報（台股證交所官方 + 美股 Yahoo 雙主機備援，0 AI）=====
+function fmtNum(n) { return Number(n).toFixed(2); }
+
+// Yahoo：query1 主、query2 備
+async function yahooQuote(symbol) {
   const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
-  const lines = [];
-  for (const s of FINANCE_SYMBOLS) {
+  for (const host of ['query1', 'query2']) {
     try {
-      const r = await (await fetch(`https://finnhub.io/api/v1/quote?symbol=${s.symbol}&token=${key}`)).json();
-      if (r && typeof r.c === 'number' && r.c > 0) {
-        const dp = typeof r.dp === 'number' ? r.dp : 0;
-        lines.push(`${s.label}　${r.c.toFixed(2)}　${dp >= 0 ? '🔺' : '🔻'}${Math.abs(dp).toFixed(2)}%`);
+      const url = `https://${host}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!res.ok) continue;
+      const j = await res.json();
+      const meta = j && j.chart && j.chart.result && j.chart.result[0] && j.chart.result[0].meta;
+      if (meta && typeof meta.regularMarketPrice === 'number') {
+        const price = meta.regularMarketPrice;
+        const prev = (typeof meta.chartPreviousClose === 'number') ? meta.chartPreviousClose : meta.previousClose;
+        return { price, chg: (typeof prev === 'number') ? (price - prev) : 0 };
       }
-    } catch (e) { console.error('財經抓取失敗：', s.symbol, e.message); }
+    } catch (e) { /* 換下一個主機 */ }
   }
-  return lines.length ? `📈 財經快報（美股前一交易日收盤）\n${lines.join('\n')}` : null;
+  return null;
+}
+
+// 證交所官方：發行量加權股價指數（台股大盤）
+async function twseTaiex() {
+  const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
+  try {
+    const res = await fetch('https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX', { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!res.ok) return null;
+    const arr = await res.json();
+    const row = Array.isArray(arr) && arr.find(r => r['指數'] === '發行量加權股價指數');
+    if (!row) return null;
+    const price = parseFloat(String(row['收盤指數']).replace(/,/g, ''));
+    let chg = parseFloat(String(row['漲跌點數']).replace(/,/g, ''));
+    if (isNaN(price)) return null;
+    chg = isNaN(chg) ? 0 : (row['漲跌'] === '-' ? -Math.abs(chg) : Math.abs(chg));
+    return { price, chg };
+  } catch (e) { return null; }
+}
+
+async function buildStockText() {
+  const lines = [];
+  for (const s of STOCK_SYMBOLS) {
+    let q = null;
+    if (s.source === 'twse') { q = await twseTaiex(); if (!q) q = await yahooQuote('^TWII'); } // 官方掛了退回 Yahoo
+    else q = await yahooQuote(s.symbol);
+    if (!q) { console.error('股市抓取失敗：', s.label); continue; }
+    lines.push(`${s.label} ${fmtNum(q.price)}(${q.chg >= 0 ? '🔺' : '🔽'}${fmtNum(Math.abs(q.chg))})`);
+  }
+  if (!lines.length) return null;
+  const p = taipeiParts();
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  return `📊 股市快報 ${p.m}/${p.d} ${pad(now.getHours())}:${pad(now.getMinutes())}\n${lines.join('\n')}`;
+}
+async function pushStock() {
+  const text = await buildStockText();
+  if (text) await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text }] });
 }
 
 // ===== 固定/週期雜事提醒 =====
