@@ -32,8 +32,19 @@ const RECURRING_REMINDERS = [
   // { title: '資源回收日', type: 'weekly',  weekday: 3 },  // 0=日 1=一 ... 6=六
 ];
 
+// 空品測站名稱（原桃園→林口；你家龜山、公司華亞/林口工三交界都靠林口站較準）
+const AQI_STATION = '林口';
+
 // 空品：AQI 大於此值就提醒（你鼻子敏感 → 50，普通以上就提醒）
 const AQI_REMIND_ABOVE = 50;
+
+// 行事曆衝突提醒（B1）：記行程前先查同時段有沒有撞到 → 照樣寫入，同時回你一聲
+const ENABLE_CONFLICT_CHECK = true;   // 直接時段重疊就提醒
+const ENABLE_BUFFER_CHECK   = false;  // 進階：間隔不到 60 分鐘也提醒（預設關）
+
+// 運動＆入睡守門員（B2，接在晚安簡報最後）：
+// 今晚 18:00–22:00 沒排行程 ＋ 空氣好(AQI≤50) ＋ 非經期 → 建議出門走走/慢跑
+const ENABLE_EXERCISE_GATE = true;
 
 // 經期設定
 const PERIOD_LEN_DEFAULT = 5;   // 生理期天數（來了之後自動算這麼多天都是生理期）
@@ -53,7 +64,7 @@ const client = new messagingApi.MessagingApiClient({
 });
 
 app.get('/', (req, res) => {
-  res.send('LINE 小管家（早/晚簡報 + 財經 + 經期/症狀紀錄）運作中 ✅');
+  res.send('LINE 小管家（早/晚簡報 + 財經 + 經期/症狀 + 行事曆守門）運作中 ✅');
 });
 
 app.post('/webhook', middleware(lineConfig), async (req, res) => {
@@ -106,6 +117,7 @@ app.get('/api/remind', async (req, res) => {
     if (type === 'news')    { await pushSingle(await buildNewsText());    return res.status(200).send('ok'); }
     if (type === 'aqi')     { await pushSingle(await buildAqiText());     return res.status(200).send('ok'); }
     if (type === 'period')  { await pushPeriodReminder();                 return res.status(200).send('ok'); }
+    if (type === 'symptom-report') { await pushSingle(await buildSymptomMonthlyReport()); return res.status(200).send('ok'); }
     res.status(400).send(`未知的提醒類型: ${type}`);
   } catch (err) {
     console.error('推播提醒時發生錯誤：', err);
@@ -119,23 +131,38 @@ async function pushSingle(text) {
 async function safe(fn) {
   try { return await fn(); } catch (e) { console.error('區塊失敗：', fn.name, e.message); return null; }
 }
+// Promise.allSettled 的小幫手：平行跑，失敗的回 null，不拖垮整則
+async function settleAll(promises) {
+  const rs = await Promise.allSettled(promises);
+  return rs.map(r => (r.status === 'fulfilled' ? r.value : null));
+}
+
+const SEP = '\n\n——————————\n\n';
 
 // ===== 早安簡報（07:00）=====
 async function pushMorningBriefing() {
+  // C1：新聞、空品平行抓（其中一個慢/壞不會卡住另一個）
+  const [news, aqi] = await settleAll([buildNewsText(), buildAqiText()]);
+  const rem = buildReminderText();
   const parts = [];
-  const news = await safe(buildNewsText);    if (news) parts.push(news);
-  const aqi  = await safe(buildAqiText);      if (aqi)  parts.push(aqi);
-  const rem  = buildReminderText();           if (rem)  parts.push(rem);
-  const body = parts.length ? parts.join('\n\n——————————\n\n') : '今天沒有特別的提醒，祝你有美好的一天 🌳';
+  if (news) parts.push(news);
+  if (aqi)  parts.push(aqi);
+  if (rem)  parts.push(rem);
+  const body = parts.length ? parts.join(SEP) : '今天沒有特別的提醒，祝你有美好的一天 🌳';
   await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text: `☀️ 早安！今天的重點：\n\n${body}` }] });
 }
 
 // ===== 晚安簡報（17:00）=====
 async function pushEveningBriefing() {
+  // C1：空品、明天天氣平行抓
+  const [aqi, wx] = await settleAll([buildAqiText(), buildWeatherText()]);
   const parts = [];
-  const aqi = await safe(buildAqiText);     if (aqi) parts.push(aqi);
-  const wx  = await safe(buildWeatherText); if (wx)  parts.push(wx);
-  const body = parts.length ? parts.join('\n\n——————————\n\n') : '🌙 今晚沒有特別提醒，早點休息喔。';
+  if (aqi) parts.push(aqi);
+  if (wx)  parts.push(wx);
+  let body = parts.length ? parts.join(SEP) : '🌙 今晚沒有特別提醒，早點休息喔。';
+  // B2：運動＆入睡守門員（有符合條件才加一行，條件不符就安靜）
+  const ex = await safe(buildExerciseGateText);
+  if (ex) body += `${SEP}${ex}`;
   await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text: body }] });
 }
 
@@ -146,17 +173,18 @@ const NEWS_FEEDS = [
   { name: 'TechCrunch', url: 'https://techcrunch.com/feed/' },
 ];
 async function fetchAllNewsItems() {
+  // C1：三個來源平行抓，單一壞掉不拖垮
   const results = [];
-  for (const feed of NEWS_FEEDS) {
-    try {
-      const parsed = await rssParser.parseURL(feed.url);
-      const items = (parsed.items || []).slice(0, 5).map((item) => ({
-        source: feed.name, title: item.title || '',
-        summary: (item.contentSnippet || item.summary || '').slice(0, 150),
-      }));
-      results.push(...items);
-    } catch (err) { console.error(`抓取 ${feed.name} RSS 失敗：`, err.message); }
-  }
+  const settled = await Promise.allSettled(NEWS_FEEDS.map(f => rssParser.parseURL(f.url)));
+  settled.forEach((r, idx) => {
+    const feed = NEWS_FEEDS[idx];
+    if (r.status !== 'fulfilled') { console.error(`抓取 ${feed.name} RSS 失敗：`, r.reason && r.reason.message); return; }
+    const items = (r.value.items || []).slice(0, 5).map((item) => ({
+      source: feed.name, title: item.title || '',
+      summary: (item.contentSnippet || item.summary || '').slice(0, 150),
+    }));
+    results.push(...items);
+  });
   return results;
 }
 async function buildNewsText() {
@@ -171,7 +199,7 @@ async function buildNewsText() {
   return extractText(geminiData);
 }
 
-// ===== 空氣品質（AQI > 門檻才回傳）=====
+// ===== 空氣品質 =====
 function describeAqi(aqiValue) {
   const aqi = parseInt(aqiValue, 10);
   if (isNaN(aqi)) return null;
@@ -182,26 +210,32 @@ function describeAqi(aqiValue) {
   if (aqi <= 300) return { aqi, level: '非常不健康 🟣', advice: '避免戶外活動，外出務必戴口罩 😷' };
   return { aqi, level: '危害 🟤', advice: '盡量待在室內，避免外出。' };
 }
-async function buildAqiText() {
+// 抓測站原始 AQI（給空品提醒和運動守門員共用）
+async function fetchAqiStation() {
   const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
   const url = `https://data.moenv.gov.tw/api/v2/aqx_p_432?offset=0&limit=1000&api_key=${process.env.MOENV_API_KEY}`;
   const res = await fetch(url);
   if (!res.ok) return null;
   const data = await res.json();
   const records = Array.isArray(data) ? data : (data.records || []);
-  const station = records.find(r => r.sitename === '桃園');
+  const station = records.find(r => r.sitename === AQI_STATION);
   if (!station) return null;
   const info = describeAqi(station.aqi);
-  if (!info || info.aqi <= AQI_REMIND_ABOVE) return null;
-  const pm25 = station['pm2.5'] || '無資料';
-  return `🌫️ 空氣品質（桃園測站）\nAQI：${info.aqi}（${info.level}）  PM2.5：${pm25}\n${info.advice}`;
+  if (!info) return null;
+  return { aqi: info.aqi, level: info.level, advice: info.advice, pm25: station['pm2.5'] || '無資料' };
+}
+// 空品提醒（AQI > 門檻才回傳）
+async function buildAqiText() {
+  const a = await fetchAqiStation();
+  if (!a || a.aqi <= AQI_REMIND_ABOVE) return null;
+  return `🌫️ 空氣品質（${AQI_STATION}測站）\nAQI：${a.aqi}（${a.level}）  PM2.5：${a.pm25}\n${a.advice}`;
 }
 
 // ===== 明天天氣（Gemini + 搜尋）=====
 async function buildWeatherText() {
   const location = '龜山（桃園）';
   const tomorrowStr = getTaipeiTomorrowString();
-  const prompt = `明天的日期是 ${tomorrowStr}（台灣時區）。請查詢「${location}」明天的天氣預報，用繁體中文簡潔地回覆，內容包含：\n1. 所在地點\n2. 明天的天氣狀況與溫度範圍\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖、適合的衣著例如薄長袖等實用建議）\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 100 字以內。開頭請用「☀️ 明日天氣預告」。`;
+  const prompt = `明天的日期是 ${tomorrowStr}（台灣時區）。請查詢「${location}」明天的天氣預報，用繁體中文簡潔地回覆，內容包含：\n1. 所在地點\n2. 明天的天氣狀況與溫度範圍\n3. 是否會下雨、降雨機率\n4. 需要注意的事項（例如要不要帶傘、防曬、保暖、適合的衣著例如薄長袖等實用建議）\n\n補充：這一帶在林口台地附近，早晚容易起霧、濕氣重。如果明天濕度偏高或有霧，請提醒帶一件防風外套、在家可以開除濕機。\n\n請用口語、像在跟朋友說話的語氣，不要太長，整段控制在 120 字以內。開頭請用「☀️ 明日天氣預告」。`;
   const geminiData = await callGemini({
     contents: [{ parts: [{ text: prompt }] }],
     tools: [{ google_search: {} }]
@@ -284,6 +318,70 @@ function buildReminderText() {
 }
 
 // =====================================================================
+// Google 行事曆（B：service account 原本只新增，現在加「讀取」）
+// =====================================================================
+function getCalendarClient() {
+  const auth = new GoogleAuth({
+    credentials: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
+    },
+    scopes: ['https://www.googleapis.com/auth/calendar'],
+  });
+  return google.calendar({ version: 'v3', auth });
+}
+
+// 讀某段時間的行程；務必排除「全天事件」(只有 start.date 沒 dateTime，如假日/生日)
+async function getEvents(timeMinISO, timeMaxISO) {
+  try {
+    const calendar = getCalendarClient();
+    const r = await calendar.events.list({
+      calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+      timeMin: timeMinISO,
+      timeMax: timeMaxISO,
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 50,
+    });
+    return (r.data.items || [])
+      .filter(e => e.start && e.start.dateTime && e.end && e.end.dateTime) // 排除全天
+      .map(e => ({ summary: e.summary || '(無標題)', start: new Date(e.start.dateTime), end: new Date(e.end.dateTime) }));
+  } catch (e) {
+    console.error('讀取行事曆失敗：', e.message);
+    return [];
+  }
+}
+function fmtClock(d) {
+  const t = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  return `${pad(t.getHours())}:${pad(t.getMinutes())}`;
+}
+
+// B1：寫入前查該時段衝突，回傳要附在確認訊息後面的提醒字串（沒事回空字串）
+async function buildConflictWarning(newStart, newEnd) {
+  if (!ENABLE_CONFLICT_CHECK) return '';
+  const overlap = await getEvents(newStart.toISOString(), newEnd.toISOString());
+  const clashes = overlap.filter(e => e.start < newEnd && e.end > newStart);
+  if (clashes.length) {
+    const list = clashes.map(c => `・${fmtClock(c.start)}–${fmtClock(c.end)} ${c.summary}`).join('\n');
+    return `\n\n⚠️ 這個時段原本就有安排：\n${list}\n（我還是照你說的記進去了，要改時間再跟我說一聲）`;
+  }
+  if (ENABLE_BUFFER_CHECK) {
+    const wideStart = new Date(newStart.getTime() - 60 * 60000);
+    const wideEnd = new Date(newEnd.getTime() + 60 * 60000);
+    const wide = await getEvents(wideStart.toISOString(), wideEnd.toISOString());
+    const near = wide
+      .filter(e => !(e.start < newEnd && e.end > newStart)) // 沒重疊的才算緩衝
+      .filter(e => (e.end <= newStart && (newStart - e.end) < 60 * 60000) ||
+                   (e.start >= newEnd && (e.start - newEnd) < 60 * 60000));
+    if (near.length) {
+      const list = near.map(c => `・${fmtClock(c.start)}–${fmtClock(c.end)} ${c.summary}`).join('\n');
+      return `\n\n💡 前後不到 1 小時還有：\n${list}\n（時間有點趕，自己斟酌一下）`;
+    }
+  }
+  return '';
+}
+
+// =====================================================================
 // 經期追蹤 + 症狀紀錄（資料存 Upstash，純規則、0 AI）
 // =====================================================================
 async function getPeriodStarts() { return (await upstashGet('period_starts')) || []; }
@@ -330,6 +428,33 @@ function predict(starts) {
     fertileEnd: addDays(ovulation, 1),
     spread: computeSpread(starts),
   };
+}
+
+// 今天落在哪個週期階段（給守門員/月報用）：'period' | 'premenstrual' | 'normal'
+function periodPhaseToday(starts) {
+  if (!starts.length) return 'normal';
+  const p = predict(starts);
+  const today = getTaipeiTodayString();
+  const sinceLast = daysBetween(p.last, today);
+  if (sinceLast >= 0 && sinceLast < PERIOD_LEN_DEFAULT) return 'period';
+  const toNext = daysBetween(today, p.nextStart);
+  if (toNext >= 0 && toNext <= 5) return 'premenstrual';
+  return 'normal';
+}
+
+// 把某個日期歸到週期階段（給症狀月報交叉分析用）
+function cyclePhaseForDate(dateKey, starts) {
+  if (!starts.length) return '未知';
+  const before = starts.filter(s => daysBetween(s, dateKey) >= 0).sort();
+  const after = starts.filter(s => daysBetween(s, dateKey) < 0).sort();
+  const last = before.length ? before[before.length - 1] : null;
+  if (last && daysBetween(last, dateKey) < PERIOD_LEN_DEFAULT) return '經期中';
+  let next = after.length ? after[0] : (last ? addDays(last, computeAvgCycle(starts)) : null);
+  if (next) {
+    const toNext = daysBetween(dateKey, next);
+    if (toNext >= 0 && toNext <= 5) return '經前';
+  }
+  return '非經期';
 }
 
 // 每天早上的經期提醒（有內容才回傳）
@@ -389,10 +514,62 @@ async function buildSymptomHistoryText() {
   return `📋 最近的症狀紀錄：\n${recent}`;
 }
 
+// A2：症狀月報 —— 最近 90 天症狀 × 週期階段交叉統計 + Gemini 保守語氣小結（1 次 AI）
+async function buildSymptomMonthlyReport() {
+  const log = (await upstashGet('symptom_log')) || [];
+  const starts = await getPeriodStarts();
+  const today = getTaipeiTodayString();
+  const cutoff = addDays(today, -90);
+  const recent = log.filter(x => x.date >= cutoff);
+  if (!recent.length) return '最近 90 天還沒有症狀紀錄，累積一些之後，月報才有東西可以看喔 📝';
+
+  const counts = { '經期中': 0, '經前': 0, '非經期': 0, '未知': 0 };
+  let headache = 0;
+  for (const x of recent) {
+    const ph = cyclePhaseForDate(x.date, starts);
+    counts[ph] = (counts[ph] || 0) + 1;
+    if (/頭痛|頭很痛|頭好痛|偏頭痛/.test(x.text)) headache++;
+  }
+  const total = recent.length;
+  const dataText =
+    `統計區間：最近 90 天（${cutoff} ~ ${today}）\n` +
+    `總症狀次數：${total}（其中含「頭痛」字樣：${headache}）\n` +
+    `依週期階段分布：經期中 ${counts['經期中']} 次、經前 ${counts['經前']} 次、非經期 ${counts['非經期']} 次、無法判斷 ${counts['未知']} 次`;
+
+  const prompt = `你是協助整理個人健康紀錄的小助理。以下是使用者最近的症狀統計。請用繁體中文、保守、不下任何診斷的語氣，寫一段 100 字以內的摘要：描述症狀是否比較集中在某個週期階段（例如「看起來比較常出現在經前」就好），並提醒這只是粗略統計、僅供參考，如果困擾建議就醫。不要 markdown、不要列點、不要誇大。\n\n${dataText}`;
+  let summary;
+  try {
+    summary = extractText(await callGemini(
+      { contents: [{ parts: [{ text: prompt }] }] },
+      { models: ['gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.5-flash'] }
+    ));
+  } catch (e) {
+    summary = '（這次沒辦法產生文字小結，先附上上面的統計數字給你參考。）';
+  }
+  return `📊 症狀月報（參考用）\n\n${dataText}\n\n—— 小結 ——\n${summary}\n\n可以把這則截圖下來，回診時給醫生參考。`;
+}
+
 async function pushPeriodReminder() {
   const starts = await getPeriodStarts();
   const text = buildPeriodReminderText(starts);
   if (text) await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text }] });
+}
+
+// B2：運動＆入睡守門員（接在晚安簡報後；條件不符就回 null，安靜不吵）
+async function buildExerciseGateText() {
+  if (!ENABLE_EXERCISE_GATE) return null;
+  const today = getTaipeiTodayString();
+  const t18 = `${today}T18:00:00+08:00`;
+  const t22 = `${today}T22:00:00+08:00`;
+  const events = await getEvents(t18, t22);
+  if (events.length) return null;              // 今晚 18–22 有安排 → 不吵
+  const a = await fetchAqiStation();
+  if (!a || a.aqi > 50) return null;           // 空氣沒到良好 → 不建議運動
+  const phase = periodPhaseToday(await getPeriodStarts());
+  if (phase === 'period' || phase === 'premenstrual') {
+    return '🧘 今晚就做點輕伸展、放鬆一下就好，不用勉強，早點休息。';
+  }
+  return '🏃 今晚 18:00–22:00 沒排行程，空氣也不錯，天氣 OK 的話很適合出門走走或慢跑，建議 19:00 前結束，比較好入睡。';
 }
 
 // ===== 日期工具（台灣時區；date key = YYYY-MM-DD）=====
@@ -456,6 +633,7 @@ function extractText(geminiData) {
 
 // ===== 對話主流程 =====
 // 先用規則處理常見指令（0 AI）；處理不了才交給 Gemini（Gemini 也會判斷經期/症狀）
+const RE_SYMPTOM_REPORT = /^(症狀|健康)?月報$|症狀月報|健康月報/;
 const RE_SYMPTOM_QUERY = /(症狀|頭痛).*(紀錄|記錄|歷史|清單|列表)/;
 const RE_PERIOD_QUERY  = /(下次|下一次|什麼時候|何時|幾天).*(月經|經期|來)|經期預測|^(月經|經期)[?？]?$/;
 const RE_PERIOD_START  = /(月經|mc|MC|大姨媽|生理期|好朋友).*(來了|來|報到)|^來了$/;
@@ -469,6 +647,9 @@ async function handleTextMessage(event) {
 
   try {
     // ---- 規則快速通道（不花 Gemini 額度）----
+    if (RE_SYMPTOM_REPORT.test(userMessage)) {
+      return reply(replyToken, await buildSymptomMonthlyReport());
+    }
     if (RE_SYMPTOM_QUERY.test(userMessage)) {
       return reply(replyToken, await buildSymptomHistoryText());
     }
@@ -520,14 +701,12 @@ async function handleTextMessage(event) {
     const parsed = JSON.parse(extractText(geminiData).replace(/```json|```/g, '').trim());
 
     if (parsed.action === 'calendar') {
-      const auth = new GoogleAuth({
-        credentials: {
-          client_email: process.env.GOOGLE_CLIENT_EMAIL,
-          private_key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
-        },
-        scopes: ['https://www.googleapis.com/auth/calendar'],
-      });
-      const calendar = google.calendar({ version: 'v3', auth });
+      // B1：先查這個時段有沒有撞到（要在寫入前查，否則會查到剛記的那筆、變成跟自己衝突）
+      let warn = '';
+      try { warn = await buildConflictWarning(new Date(parsed.startTime), new Date(parsed.endTime)); }
+      catch (e) { console.error('衝突檢查失敗：', e.message); }
+      // 再照樣寫入（不卡住；撞到也記，只是附帶提醒）
+      const calendar = getCalendarClient();
       await calendar.events.insert({
         calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
         requestBody: {
@@ -536,7 +715,7 @@ async function handleTextMessage(event) {
           end: { dateTime: parsed.endTime, timeZone: 'Asia/Taipei' },
         },
       });
-      return reply(replyToken, `📅 已寫入 Google 日曆！\n\n📌 ${parsed.summary}\n⏰ ${String(parsed.startTime).replace('T', ' ')}`);
+      return reply(replyToken, `📅 已寫入 Google 日曆！\n\n📌 ${parsed.summary}\n⏰ ${String(parsed.startTime).replace('T', ' ')}${warn}`);
     }
 
     if (parsed.action === 'period') {
