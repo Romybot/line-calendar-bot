@@ -3,5 +3,8 @@
     { "path": "/api/remind?type=stock",   "schedule": "30 22 * * *" },
     { "path": "/api/remind?type=morning", "schedule": "0 23 * * *" },
     { "path": "/api/remind?type=evening", "schedule": "0 9 * * *" }
-  ]
+  ],
+  "functions": {
+    "index.js": { "maxDuration": 60 }
+  }
 }
