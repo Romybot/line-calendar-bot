@@ -345,7 +345,7 @@ async function getEvents(timeMinISO, timeMaxISO) {
     });
     return (r.data.items || [])
       .filter(e => e.start && e.start.dateTime && e.end && e.end.dateTime) // 排除全天
-      .map(e => ({ summary: e.summary || '(無標題)', start: new Date(e.start.dateTime), end: new Date(e.end.dateTime) }));
+      .map(e => ({ id: e.id, summary: e.summary || '(無標題)', start: new Date(e.start.dateTime), end: new Date(e.end.dateTime) }));
   } catch (e) {
     console.error('讀取行事曆失敗：', e.message);
     return [];
@@ -369,7 +369,7 @@ async function buildConflictWarning(newStart, newEnd) {
   const clashes = overlap.filter(e => e.start < newEnd && e.end > newStart);
   if (clashes.length) {
     const list = clashes.map(c => `・${fmtClock(c.start)}–${fmtClock(c.end)} ${c.summary}`).join('\n');
-    return `\n\n⚠️ 這個時段原本就有安排：\n${list}\n（我還是照你說的記進去了，要改時間再跟我說一聲）`;
+    return `\n\n⚠️ 這個時段原本就有安排：\n${list}`;
   }
   if (ENABLE_BUFFER_CHECK) {
     const wideStart = new Date(newStart.getTime() - 60 * 60000);
@@ -381,11 +381,159 @@ async function buildConflictWarning(newStart, newEnd) {
                    (e.start >= newEnd && (e.start - newEnd) < 60 * 60000));
     if (near.length) {
       const list = near.map(c => `・${fmtClock(c.start)}–${fmtClock(c.end)} ${c.summary}`).join('\n');
-      return `\n\n💡 前後不到 1 小時還有：\n${list}\n（時間有點趕，自己斟酌一下）`;
+      return `\n\n💡 前後不到 1 小時還有：\n${list}`;
     }
   }
   return '';
 }
+
+// ===== 行程 新增/刪除/改期 的共用動作 =====
+async function insertEvent(summary, startLocal, endLocal) {
+  const calendar = getCalendarClient();
+  await calendar.events.insert({
+    calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+    requestBody: {
+      summary,
+      start: { dateTime: startLocal, timeZone: 'Asia/Taipei' },
+      end: { dateTime: endLocal, timeZone: 'Asia/Taipei' },
+    },
+  });
+}
+async function patchEventTime(eventId, startLocal, endLocal) {
+  const calendar = getCalendarClient();
+  await calendar.events.patch({
+    calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+    eventId,
+    requestBody: {
+      start: { dateTime: startLocal, timeZone: 'Asia/Taipei' },
+      end: { dateTime: endLocal, timeZone: 'Asia/Taipei' },
+    },
+  });
+}
+async function deleteEventById(eventId) {
+  const calendar = getCalendarClient();
+  await calendar.events.delete({ calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary', eventId });
+}
+// 依「名稱關鍵字 + 哪一天」找行程；名字對不上就回當天全部，讓使用者挑
+async function findEventsByNameDate(name, dateKey) {
+  if (!dateKey) return [];
+  const dayStart = toTaipeiDate(`${dateKey}T00:00:00`).toISOString();
+  const dayEnd = toTaipeiDate(`${dateKey}T23:59:59`).toISOString();
+  const evs = await getEvents(dayStart, dayEnd);
+  const n = (name || '').trim();
+  if (!n) return evs;
+  const hit = evs.filter(e => e.summary && (e.summary.includes(n) || n.includes(e.summary)));
+  return hit.length ? hit : evs;
+}
+function listEventsText(evs) {
+  return evs.map(e => `・${fmtClock(e.start)} ${e.summary}`).join('\n');
+}
+
+// ===== 待確認行程（衝突時先問你再動作；存 Upstash，10 分鐘內有效）=====
+const PENDING_TTL_MIN = 10;
+async function getPending() {
+  const p = await upstashGet('pending_event');
+  if (!p || !p.ts) return null;
+  if (Date.now() - p.ts > PENDING_TTL_MIN * 60000) { await upstashSet('pending_event', null); return null; }
+  return p;
+}
+async function setPending(obj) {
+  await upstashSet('pending_event', obj ? { ...obj, ts: Date.now() } : null);
+}
+
+// ===== 全域短期記憶（最近幾句；間隔太久自動當新話題）=====
+const CHAT_HISTORY_MAX = 5;         // 最多保留幾輪
+const CHAT_GAP_RESET_MIN = 30;      // 間隔超過幾分鐘視為新話題
+async function getChatHistory() {
+  const h = (await upstashGet('chat_history')) || [];
+  if (!h.length) return [];
+  const last = h[h.length - 1];
+  if (last && last.ts && (Date.now() - last.ts) > CHAT_GAP_RESET_MIN * 60000) return [];
+  return h;
+}
+async function appendChatHistory(userText, botText) {
+  let h = (await upstashGet('chat_history')) || [];
+  const now = Date.now();
+  if (h.length && h[h.length - 1].ts && (now - h[h.length - 1].ts) > CHAT_GAP_RESET_MIN * 60000) h = [];
+  h.push({ role: 'user', text: userText, ts: now });
+  h.push({ role: 'model', text: String(botText).slice(0, 500), ts: now });
+  if (h.length > CHAT_HISTORY_MAX * 2) h = h.slice(-CHAT_HISTORY_MAX * 2);
+  await upstashSet('chat_history', h);
+}
+function historyToPromptText(h) {
+  if (!h.length) return '';
+  const lines = h.map(m => `${m.role === 'user' ? '使用者' : '你'}：${m.text}`).join('\n');
+  return `\n\n【最近的對話，幫助你理解上下文，不要照抄】\n${lines}\n`;
+}
+
+// ===== 日期/時間解析（給「改到…」用；回台灣當地字串）=====
+function taipeiISOLocal(d) {
+  const t = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}T${pad(t.getHours())}:${pad(t.getMinutes())}:00`;
+}
+// 從文字抓「日期」(未來優先)：明天/後天/大後天/今天/M月D日/M/D
+function extractDateKey(text) {
+  const today = getTaipeiTodayString();
+  if (/大後天/.test(text)) return addDays(today, 3);
+  if (/後天/.test(text)) return addDays(today, 2);
+  if (/明天|明日/.test(text)) return addDays(today, 1);
+  if (/今天|今日/.test(text)) return today;
+  const md = text.match(/(\d{1,2})\s*[\/月]\s*(\d{1,2})/);
+  if (md) {
+    const p = taipeiParts();
+    let key = `${p.y}-${pad(parseInt(md[1], 10))}-${pad(parseInt(md[2], 10))}`;
+    if (daysBetween(today, key) < -1) key = `${p.y + 1}-${pad(parseInt(md[1], 10))}-${pad(parseInt(md[2], 10))}`; // 已過就算明年
+    return key;
+  }
+  return null;
+}
+// 中文數字→阿拉伯（1~12，支援 十/十一/十二/兩）
+function cnHour(s) {
+  const map = { 零: 0, 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (s === '十') return 10;
+  if (s.length === 2 && s[0] === '十') return 10 + (map[s[1]] || 0);
+  if (s.length === 1) return map[s] != null ? map[s] : null;
+  return null;
+}
+function applyAmPm(h, ap) {
+  if ((ap === '下午' || ap === '晚上' || ap === '傍晚') && h < 12) h += 12;
+  if (ap === '中午' && h < 12) h = 12;
+  if ((ap === '早上' || ap === '上午' || ap === '凌晨') && h === 12) h = 0;
+  return h;
+}
+// 從文字抓「時間」：15:30 / 下午3點 / 晚上7點半 / 早上十點
+function extractTime(text) {
+  let m = text.match(/(\d{1,2})\s*[:：]\s*(\d{2})/);
+  if (m) return { h: parseInt(m[1], 10), m: parseInt(m[2], 10) };
+  m = text.match(/(上午|早上|凌晨|中午|下午|晚上|傍晚)?\s*(\d{1,2})\s*點\s*(半|\d{1,2})?/);
+  if (m) {
+    const h = applyAmPm(parseInt(m[2], 10), m[1]);
+    const min = m[3] === '半' ? 30 : (m[3] ? parseInt(m[3], 10) : 0);
+    return { h, m: min };
+  }
+  m = text.match(/(上午|早上|凌晨|中午|下午|晚上|傍晚)?\s*([零一二兩三四五六七八九十]{1,3})\s*點\s*(半)?/);
+  if (m) {
+    const hc = cnHour(m[2]);
+    if (hc != null) return { h: applyAmPm(hc, m[1]), m: m[3] === '半' ? 30 : 0 };
+  }
+  return null;
+}
+// 把使用者「改到…」的話，套用到 pending（保留原本時長）；抓不到回 null
+function resolveRescheduleLocal(text, pending) {
+  const dateHit = extractDateKey(text);
+  const timeHit = extractTime(text);
+  if (!dateHit && !timeHit) return null;
+  const durMs = toTaipeiDate(pending.endLocal) - toTaipeiDate(pending.startLocal);
+  const dateKey = dateHit || pending.startLocal.slice(0, 10);
+  const hh = timeHit ? timeHit.h : parseInt(pending.startLocal.slice(11, 13), 10);
+  const mm = timeHit ? timeHit.m : parseInt(pending.startLocal.slice(14, 16), 10);
+  const startLocal = `${dateKey}T${pad(hh)}:${pad(mm)}:00`;
+  const endLocal = taipeiISOLocal(new Date(toTaipeiDate(startLocal).getTime() + durMs));
+  return { startLocal, endLocal };
+}
+const RE_CONFIRM = /^(記|照記|確定|好|好的|可以|就這樣|照樣記|記吧|幫我記|ok|OK|是|對)/;
+const RE_DECLINE = /^(取消|不要|不用|不記|別記|算了|先不要|不了)/;
+const RE_TIMEISH = /改|點|[:：]|號|週|周|禮拜|拜|明天|後天|早上|上午|中午|下午|晚上|傍晚|\d/;
 
 // =====================================================================
 // 經期追蹤 + 症狀紀錄（資料存 Upstash，純規則、0 AI）
@@ -646,46 +794,112 @@ const RE_PERIOD_START  = /(月經|mc|MC|大姨媽|生理期|好朋友).*(來了|
 const RE_SYMPTOM       = /(偏?頭痛|頭很痛|頭好痛|頭在痛|經痛|生理痛|肚子痛|想吐|噁心|反胃|頭暈|不舒服|好痛)/;
 function isQuestion(t) { return /[?？]|嗎|怎麼|如何|可不可以|可以.*嗎|該不該|要不要|多少|哪/.test(t); }
 
+// Gemini 解析「改到…」（規則讀不懂時備援）；回 {cancel} 或 {startLocal,endLocal} 或 null
+async function parseRescheduleByGemini(userMessage, pending) {
+  const today = getTaipeiTodayString();
+  const prompt = `使用者原本要記的行程是「${pending.summary}」，原時間 ${pending.startLocal}（台灣時間）。今天是 ${today}。使用者現在說：「${userMessage}」。\n請判斷新的時間，只回 JSON、不要其他文字：{"cancel": false, "newStartTime": "YYYY-MM-DDTHH:mm:ss", "newEndTime": "YYYY-MM-DDTHH:mm:ss"}。沒給結束時間就設開始後 1 小時。如果其實是要取消，cancel=true、時間留空。`;
+  try {
+    const g = JSON.parse(extractText(await callGemini(
+      { contents: [{ parts: [{ text: prompt }] }] },
+      { models: ['gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.5-flash'] }
+    )).replace(/```json|```/g, '').trim());
+    if (g.cancel) return { cancel: true };
+    if (g.newStartTime && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(g.newStartTime)) {
+      let s = g.newStartTime; if (s.length === 16) s += ':00'; s = s.slice(0, 19);
+      let e = (g.newEndTime && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(g.newEndTime)) ? g.newEndTime : '';
+      if (e.length === 16) e += ':00'; e = e.slice(0, 19);
+      if (!e) e = taipeiISOLocal(new Date(toTaipeiDate(s).getTime() + 60 * 60000));
+      return { startLocal: s, endLocal: e };
+    }
+  } catch (err) { console.error('改期解析失敗：', err.message); }
+  return null;
+}
+
+// 共用：把一筆 pending 以指定時間寫入，撞到就再問、沒撞就記
+async function commitOrAsk(replyToken, userMessage, summary, startLocal, endLocal) {
+  let warn = '';
+  try { warn = await buildConflictWarning(toTaipeiDate(startLocal), toTaipeiDate(endLocal)); }
+  catch (e) { console.error('衝突檢查失敗：', e.message); }
+  if (warn) {
+    await setPending({ summary, startLocal, endLocal });
+    return respond(replyToken, userMessage,
+      `📌 ${summary}\n⏰ ${String(startLocal).replace('T', ' ')}${warn}\n\n要我怎麼做？回「記」照記、回「改到○月○日○點」改期、回「取消」放棄。`);
+  }
+  await insertEvent(summary, startLocal, endLocal);
+  await setPending(null);
+  return respond(replyToken, userMessage,
+    `📅 已寫入 Google 日曆！\n\n📌 ${summary}\n⏰ ${String(startLocal).replace('T', ' ')}`);
+}
+
 async function handleTextMessage(event) {
   const userMessage = (event.message.text || '').trim();
   const replyToken = event.replyToken;
   console.log('=== 你的 LINE userId 是：', event.source.userId, '===');
 
   try {
+    // ===== 0. 有「待確認行程」時，這句優先當作你的回覆 =====
+    const pending = await getPending();
+    if (pending) {
+      if (RE_DECLINE.test(userMessage)) {
+        await setPending(null);
+        return respond(replyToken, userMessage, '好，那這筆就不記了 👌');
+      }
+      if (RE_CONFIRM.test(userMessage)) {
+        await insertEvent(pending.summary, pending.startLocal, pending.endLocal);
+        await setPending(null);
+        return respond(replyToken, userMessage, `📅 好，照原時間記進去了！\n\n📌 ${pending.summary}\n⏰ ${pending.startLocal.replace('T', ' ')}`);
+      }
+      const resolved = resolveRescheduleLocal(userMessage, pending);
+      if (resolved) return commitOrAsk(replyToken, userMessage, pending.summary, resolved.startLocal, resolved.endLocal);
+      if (RE_TIMEISH.test(userMessage)) {
+        const g = await parseRescheduleByGemini(userMessage, pending);
+        if (g && g.cancel) { await setPending(null); return respond(replyToken, userMessage, '好，那這筆就不記了 👌'); }
+        if (g && g.startLocal) return commitOrAsk(replyToken, userMessage, pending.summary, g.startLocal, g.endLocal);
+        return respond(replyToken, userMessage, '我沒抓到要改到什麼時候，這筆先幫你保留著。你可以回「記」、「取消」，或再講一次新的日期時間。');
+      }
+      // 看起來是換話題 → 放掉 pending，繼續照一般流程處理
+      await setPending(null);
+    }
+
     // ---- 規則快速通道（不花 Gemini 額度）----
     if (RE_SYMPTOM_REPORT.test(userMessage)) {
-      return reply(replyToken, await buildSymptomMonthlyReport());
+      return respond(replyToken, userMessage, await buildSymptomMonthlyReport());
     }
     if (RE_SYMPTOM_QUERY.test(userMessage)) {
-      return reply(replyToken, await buildSymptomHistoryText());
+      return respond(replyToken, userMessage, await buildSymptomHistoryText());
     }
     if (RE_PERIOD_QUERY.test(userMessage) && !RE_PERIOD_START.test(userMessage)) {
-      return reply(replyToken, buildPredictionReplyText(await getPeriodStarts()));
+      return respond(replyToken, userMessage, buildPredictionReplyText(await getPeriodStarts()));
     }
     if (RE_PERIOD_START.test(userMessage) && !isQuestion(userMessage)) {
       const d = parseWhen(userMessage);
       const starts = await logPeriodStart(d);
       const periodEnd = addDays(d, PERIOD_LEN_DEFAULT - 1);
-      return reply(replyToken, `📝 已記錄月經開始：${d}（生理期約 ${d} ~ ${periodEnd}）\n\n${buildPredictionReplyText(starts)}`);
+      return respond(replyToken, userMessage, `📝 已記錄月經開始：${d}（生理期約 ${d} ~ ${periodEnd}）\n\n${buildPredictionReplyText(starts)}`);
     }
     if (RE_SYMPTOM.test(userMessage) && !isQuestion(userMessage)) {
       const d = parseWhen(userMessage);
       await logSymptom(d, userMessage);
-      return reply(replyToken, `📝 已記錄：${d}　${userMessage} 🤕\n記得多休息，不舒服就別硬撐。`);
+      return respond(replyToken, userMessage, `📝 已記錄：${d}　${userMessage} 🤕\n記得多休息，不舒服就別硬撐。`);
     }
 
-    // ---- 交給 Gemini（同一次呼叫同時判斷 calendar/period/symptom/chat）----
+    // ---- 交給 Gemini（帶最近對話；判斷 calendar/刪除/改期/period/symptom/chat）----
+    const history = await getChatHistory();
     const todayStr = getTaipeiTodayString();
     const prompt = `你是一個 LINE 個人助理。請判斷使用者訊息屬於哪一類，並依規則給出處理結果。
 
-今天的正確日期是 ${todayStr}（台灣時區）。
+今天的正確日期是 ${todayStr}（台灣時區）。${historyToPromptText(history)}
 
 請嚴格只回傳以下 JSON（不要 markdown、不要多餘文字）：
 {
-  "action": "calendar | period | symptom | chat",
+  "action": "calendar | calendar_delete | calendar_update | period | symptom | chat",
   "summary": "",
   "startTime": "",
   "endTime": "",
+  "targetSummary": "",
+  "targetDate": "",
+  "newStartTime": "",
+  "newEndTime": "",
   "periodDate": "",
   "symptomText": "",
   "symptomDate": "",
@@ -693,10 +907,12 @@ async function handleTextMessage(event) {
 }
 
 規則：
-1. 要新增/記錄行程或請假 → action=calendar；summary=標題；startTime/endTime 用 YYYY-MM-DDTHH:mm:ss（沒給時間預設當天09:00，沒給結束時間設開始後1小時）。
-2. 使用者「表示月經/生理期來了」（陳述，不是提問）→ action=period；periodDate 填開始日 YYYY-MM-DD（沒指明日期就用今天）。
-3. 使用者「描述自己身體不適或症狀」如頭痛、偏頭痛、經痛、想吐等（陳述，不是提問）→ action=symptom；symptomText 用簡短描述；symptomDate 用 YYYY-MM-DD（沒指明就今天）。
-4. 其他（提問、查資料、聊天，包含「問頭痛怎麼辦」這種提問）→ action=chat；chatReply 用繁體中文口語簡潔回答。需要最新資訊時主動用搜尋工具。
+1. 新增/記錄行程或請假 → action=calendar；summary=標題；startTime/endTime 用 YYYY-MM-DDTHH:mm:ss（沒給時間預設當天09:00，沒給結束時間設開始後1小時）。
+2. 要刪除/取消某個已存在的行程 → action=calendar_delete；targetSummary=行程名稱關鍵字；targetDate=那天 YYYY-MM-DD（講不清楚就留空）。
+3. 要把某個已存在的行程改時間/改期 → action=calendar_update；targetSummary=行程名稱關鍵字；targetDate=原本那天 YYYY-MM-DD；newStartTime/newEndTime=新時間 YYYY-MM-DDTHH:mm:ss（沒給結束設開始後1小時）。
+4. 「表示月經/生理期來了」（陳述，不是提問）→ action=period；periodDate 填開始日 YYYY-MM-DD（沒指明就今天）。
+5. 「描述自己身體不適或症狀」如頭痛、偏頭痛、經痛、想吐等（陳述，不是提問）→ action=symptom；symptomText 簡短描述；symptomDate 用 YYYY-MM-DD（沒指明就今天）。
+6. 其他（提問、查資料、聊天）→ action=chat；chatReply 用繁體中文口語簡潔回答，可參考上面最近的對話。需要最新資訊時主動用搜尋工具。
 
 使用者訊息："${userMessage}"`;
 
@@ -707,38 +923,59 @@ async function handleTextMessage(event) {
     const parsed = JSON.parse(extractText(geminiData).replace(/```json|```/g, '').trim());
 
     if (parsed.action === 'calendar') {
-      // B1：先查這個時段有沒有撞到（要在寫入前查，否則會查到剛記的那筆、變成跟自己衝突）
+      // B1：衝突就先問你再動作（commitOrAsk 內會查衝突）
+      return commitOrAsk(replyToken, userMessage, parsed.summary, parsed.startTime, parsed.endTime);
+    }
+
+    if (parsed.action === 'calendar_delete') {
+      if (!parsed.targetDate) {
+        return respond(replyToken, userMessage, '要刪哪一天的行程呢？跟我說日期＋名稱，例如「刪掉 12/28 的家庭聚餐」。');
+      }
+      const hits = await findEventsByNameDate(parsed.targetSummary, parsed.targetDate);
+      if (!hits.length) {
+        return respond(replyToken, userMessage, `${parsed.targetDate} 那天沒找到${parsed.targetSummary ? `「${parsed.targetSummary}」` : '有時間的行程'}。`);
+      }
+      if (hits.length > 1) {
+        return respond(replyToken, userMessage, `${parsed.targetDate} 那天有好幾筆，告訴我是哪個時間的：\n${listEventsText(hits)}`);
+      }
+      await deleteEventById(hits[0].id);
+      return respond(replyToken, userMessage, `🗑️ 已刪除：${hits[0].summary}（${parsed.targetDate} ${fmtClock(hits[0].start)}）`);
+    }
+
+    if (parsed.action === 'calendar_update') {
+      if (!parsed.targetDate || !parsed.newStartTime) {
+        return respond(replyToken, userMessage, '要改哪一筆、改到什麼時候呢？例如「把 12/28 的家庭聚餐改到 12/30 晚上7點」。');
+      }
+      const hits = await findEventsByNameDate(parsed.targetSummary, parsed.targetDate);
+      if (!hits.length) {
+        return respond(replyToken, userMessage, `${parsed.targetDate} 那天沒找到${parsed.targetSummary ? `「${parsed.targetSummary}」` : '可改的行程'}。`);
+      }
+      if (hits.length > 1) {
+        return respond(replyToken, userMessage, `${parsed.targetDate} 那天有好幾筆，先告訴我是哪個時間的：\n${listEventsText(hits)}`);
+      }
+      const newEnd = parsed.newEndTime || taipeiISOLocal(new Date(toTaipeiDate(parsed.newStartTime).getTime() + 60 * 60000));
+      // 改期前先查新時段（此時原行程還在舊時間，不會查到自己）
       let warn = '';
-      try { warn = await buildConflictWarning(toTaipeiDate(parsed.startTime), toTaipeiDate(parsed.endTime)); }
-      catch (e) { console.error('衝突檢查失敗：', e.message); }
-      // 再照樣寫入（不卡住；撞到也記，只是附帶提醒）
-      const calendar = getCalendarClient();
-      await calendar.events.insert({
-        calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
-        requestBody: {
-          summary: parsed.summary,
-          start: { dateTime: parsed.startTime, timeZone: 'Asia/Taipei' },
-          end: { dateTime: parsed.endTime, timeZone: 'Asia/Taipei' },
-        },
-      });
-      return reply(replyToken, `📅 已寫入 Google 日曆！\n\n📌 ${parsed.summary}\n⏰ ${String(parsed.startTime).replace('T', ' ')}${warn}`);
+      try { warn = await buildConflictWarning(toTaipeiDate(parsed.newStartTime), toTaipeiDate(newEnd)); } catch (e) { /* 忽略 */ }
+      await patchEventTime(hits[0].id, parsed.newStartTime, newEnd);
+      return respond(replyToken, userMessage, `🔁 已改期：${hits[0].summary}\n⏰ ${String(parsed.newStartTime).replace('T', ' ')}${warn ? `${warn}\n（新時間也有安排，自己確認一下）` : ''}`);
     }
 
     if (parsed.action === 'period') {
       const d = (parsed.periodDate && /^\d{4}-\d{2}-\d{2}$/.test(parsed.periodDate)) ? parsed.periodDate : getTaipeiTodayString();
       const starts = await logPeriodStart(d);
       const periodEnd = addDays(d, PERIOD_LEN_DEFAULT - 1);
-      return reply(replyToken, `📝 已記錄月經開始：${d}（生理期約 ${d} ~ ${periodEnd}）\n\n${buildPredictionReplyText(starts)}`);
+      return respond(replyToken, userMessage, `📝 已記錄月經開始：${d}（生理期約 ${d} ~ ${periodEnd}）\n\n${buildPredictionReplyText(starts)}`);
     }
 
     if (parsed.action === 'symptom') {
       const d = (parsed.symptomDate && /^\d{4}-\d{2}-\d{2}$/.test(parsed.symptomDate)) ? parsed.symptomDate : getTaipeiTodayString();
       const txt = parsed.symptomText || userMessage;
       await logSymptom(d, txt);
-      return reply(replyToken, `📝 已記錄：${d}　${txt} 🤕\n記得多休息，不舒服就別硬撐。`);
+      return respond(replyToken, userMessage, `📝 已記錄：${d}　${txt} 🤕\n記得多休息，不舒服就別硬撐。`);
     }
 
-    return reply(replyToken, parsed.chatReply || '嗯...我沒想到要怎麼回答，可以換個方式問我嗎？');
+    return respond(replyToken, userMessage, parsed.chatReply || '嗯...我沒想到要怎麼回答，可以換個方式問我嗎？');
 
   } catch (error) {
     console.error('詳細錯誤記錄：', error);
@@ -748,6 +985,11 @@ async function handleTextMessage(event) {
 
 async function reply(replyToken, text) {
   await client.replyMessage({ replyToken, messages: [{ type: 'text', text }] });
+}
+// 回覆並把這一輪存進短期記憶（供下一句理解上下文）
+async function respond(replyToken, userMessage, text) {
+  await reply(replyToken, text);
+  try { await appendChatHistory(userMessage, text); } catch (e) { console.error('存對話失敗：', e.message); }
 }
 
 const PORT = process.env.PORT || 3000;
