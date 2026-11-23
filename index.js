@@ -355,6 +355,12 @@ function fmtClock(d) {
   const t = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
   return `${pad(t.getHours())}:${pad(t.getMinutes())}`;
 }
+// Gemini 回的時間字串多半沒帶時區(YYYY-MM-DDTHH:mm:ss)，在 UTC 伺服器上會被當 UTC。
+// 一律當台灣時間解讀；若已帶 Z 或 ±hh:mm 就照原樣。
+function toTaipeiDate(s) {
+  if (!s) return null;
+  return /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? new Date(s) : new Date(`${s}+08:00`);
+}
 
 // B1：寫入前查該時段衝突，回傳要附在確認訊息後面的提醒字串（沒事回空字串）
 async function buildConflictWarning(newStart, newEnd) {
@@ -703,7 +709,7 @@ async function handleTextMessage(event) {
     if (parsed.action === 'calendar') {
       // B1：先查這個時段有沒有撞到（要在寫入前查，否則會查到剛記的那筆、變成跟自己衝突）
       let warn = '';
-      try { warn = await buildConflictWarning(new Date(parsed.startTime), new Date(parsed.endTime)); }
+      try { warn = await buildConflictWarning(toTaipeiDate(parsed.startTime), toTaipeiDate(parsed.endTime)); }
       catch (e) { console.error('衝突檢查失敗：', e.message); }
       // 再照樣寫入（不卡住；撞到也記，只是附帶提醒）
       const calendar = getCalendarClient();
