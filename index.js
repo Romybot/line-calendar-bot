@@ -112,7 +112,12 @@ app.get('/api/remind', async (req, res) => {
       return res.status(200).send('已推送早安簡報');
     }
     if (type === 'evening') { await pushEveningBriefing(); return res.status(200).send('已推送晚安簡報'); }
-    if (type === 'stock')   { await pushStock();           return res.status(200).send('已推送股市快報'); }
+    if (type === 'stock')   {
+      await pushStock();
+      await safe(pushPicks);                // 接著推前一個交易日的選股結果（有資料才送）
+      return res.status(200).send('已推送股市快報');
+    }
+    if (type === 'picks')   { await pushPicks();           return res.status(200).send('已推送選股'); }
     if (type === 'weather') { await pushSingle(await buildWeatherText()); return res.status(200).send('ok'); }
     if (type === 'news')    { await pushSingle(await buildNewsText());    return res.status(200).send('ok'); }
     if (type === 'aqi')     { await pushSingle(await buildAqiText());     return res.status(200).send('ok'); }
@@ -297,6 +302,32 @@ async function buildStockText() {
   const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
   return `📊 股市快報 ${p.m}/${p.d} ${pad(now.getHours())}:${pad(now.getMinutes())}\n${lines.join('\n')}`;
 }
+// ===== 選股觀察（GitHub Actions 每個交易日收盤後算好、存 Upstash；這裡只讀取、0 AI）=====
+function fmtPct(v) { return (v === null || v === undefined) ? '' : `${v >= 0 ? '+' : ''}${v}%`; }
+async function buildPicksText() {
+  const p = await upstashGet('stock_picks');
+  if (!p || !p.date) return null;
+  const today = getTaipeiTodayString();
+  if (daysBetween(p.date, today) > 5) return null;            // 太舊的不推
+  const md = p.date.slice(5).replace('-', '/');
+  const multi = (p.multi || []).map((x, i) =>
+    `${i + 1}. ${x.code} ${x.name || ''} ${fmtPct(x.chg)}${x.buckets && x.buckets.length ? '｜' + x.buckets.join('·') : ''}`).join('\n');
+  const empty = (p.empty || []).map((x, i) =>
+    `${i + 1}. ${x.code} ${x.name || ''} ${fmtPct(x.chg)}`).join('\n');
+  const rel = Object.entries(p.release || {})
+    .filter(([d]) => d >= today).slice(0, 5)
+    .map(([d, items]) => `${d.slice(5).replace('-', '/')}：${items.map(x => x.code + x.name).join('、')}`).join('\n');
+  return `📈 選股觀察（${md} 收盤）\n\n` +
+    `【多觀察】\n${multi || '（沒有符合條件的）'}\n\n` +
+    `【空觀察】\n${empty || '（沒有符合條件的）'}` +
+    (rel ? `\n\n【近期出關】\n${rel}` : '') +
+    `\n\n※ 依收盤資料計算，僅供參考，不是投資建議。`;
+}
+async function pushPicks() {
+  const text = await buildPicksText();
+  if (text) await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text }] });
+}
+
 async function pushStock() {
   const text = await buildStockText();
   if (text) await client.pushMessage({ to: process.env.LINE_USER_ID, messages: [{ type: 'text', text }] });
@@ -463,7 +494,7 @@ async function appendChatHistory(userText, botText) {
 function historyToPromptText(h) {
   if (!h.length) return '';
   const lines = h.map(m => `${m.role === 'user' ? '使用者' : '你'}：${m.text}`).join('\n');
-  return `\n\n【最近的對話，幫助你理解上下文，不要照抄】\n${lines}\n`;
+  return `\n\n【最近的對話，幫助你理解上下文；不要照抄、不要重複你自己說過的話或問過的問題】\n${lines}\n`;
 }
 
 // ===== 日期/時間解析（給「改到…」用；回台灣當地字串）=====
@@ -769,7 +800,7 @@ async function callGemini(body, { models = GEMINI_MODELS, retries = 1 } = {}) {
       try {
         res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       } catch (e) { lastErr = e; break; }
-      if (res.ok) return res.json();
+      if (res.ok) { console.log('Gemini 使用模型：', model); return res.json(); }
       const errorText = await res.text();
       if (res.status === 429) { lastErr = new Error(`${model} 今日額度用盡`); break; }
       if (res.status === 503 && attempt < retries) { await new Promise(r => setTimeout(r, 1500 * (attempt + 1))); continue; }
@@ -787,6 +818,7 @@ function extractText(geminiData) {
 
 // ===== 對話主流程 =====
 // 先用規則處理常見指令（0 AI）；處理不了才交給 Gemini（Gemini 也會判斷經期/症狀）
+const RE_PICKS = /^(選股|多空|選股清單|今日選股|多空觀察)$/;
 const RE_SYMPTOM_REPORT = /^(症狀|健康)?月報$|症狀月報|健康月報/;
 const RE_SYMPTOM_QUERY = /(症狀|頭痛).*(紀錄|記錄|歷史|清單|列表)/;
 const RE_PERIOD_QUERY  = /(下次|下一次|什麼時候|何時|幾天).*(月經|經期|來)|經期預測|^(月經|經期)[?？]?$/;
@@ -862,6 +894,9 @@ async function handleTextMessage(event) {
     }
 
     // ---- 規則快速通道（不花 Gemini 額度）----
+    if (RE_PICKS.test(userMessage)) {
+      return respond(replyToken, userMessage, (await buildPicksText()) || '目前還沒有選股資料，等 GitHub 每天收盤後跑完才會有喔 📈');
+    }
     if (RE_SYMPTOM_REPORT.test(userMessage)) {
       return respond(replyToken, userMessage, await buildSymptomMonthlyReport());
     }
@@ -913,6 +948,12 @@ async function handleTextMessage(event) {
 4. 「表示月經/生理期來了」（陳述，不是提問）→ action=period；periodDate 填開始日 YYYY-MM-DD（沒指明就今天）。
 5. 「描述自己身體不適或症狀」如頭痛、偏頭痛、經痛、想吐等（陳述，不是提問）→ action=symptom；symptomText 簡短描述；symptomDate 用 YYYY-MM-DD（沒指明就今天）。
 6. 其他（提問、查資料、聊天）→ action=chat；chatReply 用繁體中文口語簡潔回答，可參考上面最近的對話。需要最新資訊時主動用搜尋工具。
+
+回答聊天時的原則（很重要）：
+- 使用者住桃園龜山、上班在林口（華亞科技園區附近）。問「附近」的店、餐廳、地點時，直接用這兩區搜尋，不要反問在哪裡。
+- 使用者說「隨便」「你決定」「都可以」「不知道」時，代表要你直接做決定：馬上給 2～3 個具體推薦（店名或品項＋一句理由），不要再反問。
+- 最多只能反問一次。上面最近的對話裡你已經問過的問題，絕對不要再問第二次，改成直接給答案。
+- 不要重複你上一則講過的話。
 
 使用者訊息："${userMessage}"`;
 
